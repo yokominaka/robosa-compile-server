@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Robosa – Compile & Simulate Demo</title>
+<link rel="icon" href="data:," />
+<style>
+  :root { --bg:#0f1419; --panel:#1a2129; --line:#2a333d; --text:#d6dde5; --muted:#7d8a97; --accent:#3fb6ff; --err:#ff5f5f; --warn:#ffc04d; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; gap:12px; padding:12px 20px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header .status { margin-left:auto; font-size:13px; color:var(--muted); }
+  main { display:grid; grid-template-columns: 1.2fr 1fr; gap:16px; padding:16px 20px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .panel h2 { margin:0; padding:8px 12px; font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); border-bottom:1px solid var(--line); }
+  .editor { display:flex; height:420px; font: 13px/20px ui-monospace, Consolas, monospace; }
+  .gutter { padding:8px 6px; text-align:right; color:var(--muted); background:#151b22; user-select:none; overflow:hidden; min-width:40px; }
+  .gutter div.bad { color:#fff; background:var(--err); border-radius:3px; }
+  .gutter div.warn { color:#000; background:var(--warn); border-radius:3px; }
+  textarea { flex:1; resize:none; border:0; outline:0; padding:8px 10px; background:transparent; color:var(--text); font:inherit; white-space:pre; tab-size:2; }
+  .toolbar { display:flex; gap:8px; padding:10px 12px; border-top:1px solid var(--line); }
+  button { background:var(--accent); color:#00121f; border:0; border-radius:6px; padding:8px 14px; font-weight:600; cursor:pointer; }
+  button.secondary { background:#2a333d; color:var(--text); }
+  button:disabled { opacity:.5; cursor:default; }
+  .diag { max-height:140px; overflow:auto; font: 12px/18px ui-monospace, Consolas, monospace; }
+  .diag div { padding:4px 12px; border-bottom:1px solid var(--line); cursor:pointer; }
+  .diag div:hover { background:#222b35; }
+  .diag .error b { color:var(--err); } .diag .warning b { color:var(--warn); }
+  .diag .ok { color:#5fd38d; cursor:default; }
+  .board { padding:24px 12px; display:flex; justify-content:center; gap:18px; flex-wrap:wrap; }
+  .led { display:flex; flex-direction:column; align-items:center; gap:6px; font-size:12px; color:var(--muted); }
+  .led span { width:34px; height:34px; border-radius:50%; background:#3a1414; border:2px solid #552020; transition: background .03s, box-shadow .03s; }
+  .led span.on { background:#ff3b3b; box-shadow:0 0 18px 4px #ff3b3baa; border-color:#ff8080; }
+  .led.builtin span { background:#3a2e10; border-color:#5a4a20; }
+  .led.builtin span.on { background:#ffcc33; box-shadow:0 0 18px 4px #ffcc33aa; border-color:#ffe080; }
+  .serial { height:150px; overflow:auto; margin:0; padding:8px 12px; font: 12px/18px ui-monospace, Consolas, monospace; white-space:pre-wrap; }
+  .meta { padding:8px 12px; font-size:12px; color:var(--muted); border-top:1px solid var(--line); }
+  .stack { display:flex; flex-direction:column; gap:16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🤖 Robosa · Compile &amp; Simulate</h1>
+  <span class="status" id="status">Idle</span>
+</header>
+
+<main>
+  <div class="stack">
+    <section class="panel">
+      <h2>sketch.ino</h2>
+      <div class="editor">
+        <div class="gutter" id="gutter"></div>
+        <textarea id="code" spellcheck="false"></textarea>
+      </div>
+      <div class="toolbar">
+        <button id="run">▶ Compile &amp; Run</button>
+        <button id="stop" class="secondary" disabled>■ Stop</button>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Compiler output</h2>
+      <div class="diag" id="diag"><div class="ok">Press “Compile &amp; Run”.</div></div>
+    </section>
+  </div>
+
+  <div class="stack">
+    <section class="panel">
+      <h2>Virtual Arduino Uno – pins 8–13</h2>
+      <div class="board" id="board"></div>
+      <div class="meta" id="meta">Simulator stopped.</div>
+    </section>
+    <section class="panel">
+      <h2>Serial monitor (9600 baud)</h2>
+      <pre class="serial" id="serial"></pre>
+    </section>
+  </div>
+</main>
+
+<script type="module">
+  // avr8js: an ATmega328P (Arduino Uno chip) emulator written in JavaScript
+  import {
+    CPU, avrInstruction, AVRTimer, timer0Config, AVRIOPort,
+    portBConfig, portDConfig, AVRUSART, usart0Config, PinState,
+  } from 'https://cdn.jsdelivr.net/npm/avr8js/+esm';
+
+  const COMPILE_URL = 'http://localhost:8080/compile';
+  const CPU_HZ = 16_000_000; // Uno runs at 16 MHz
+
+  const BLINK_CODE = `
+// LEDs connected to pins 8..13
+
+byte leds[] = {13, 12, 11, 10, 9, 8};
+void setup() {
+  for (byte i = 0; i < sizeof(leds); i++) {
+    pinMode(leds[i], OUTPUT);
+  }
+}
+
+int i = 0;
+void loop() {
+  digitalWrite(leds[i], HIGH);
+  delay(250);
+  digitalWrite(leds[i], LOW);
+  i = (i + 1) % sizeof(leds);
+}`.trim();
+
+  // ---------- DOM ----------
+  const $ = (id) => document.getElementById(id);
+  const codeEl = $('code'), gutterEl = $('gutter'), diagEl = $('diag');
+  const statusEl = $('status'), metaEl = $('meta'), serialEl = $('serial');
+  const runBtn = $('run'), stopBtn = $('stop');
+
+  // Build the 6 LEDs (pin 13 is the Uno's built-in "L" LED)
+  const ledEls = {};
+  for (const pin of [13, 12, 11, 10, 9, 8]) {
+    const wrap = document.createElement('div');
+    wrap.className = 'led' + (pin === 13 ? ' builtin' : '');
+    wrap.innerHTML = `<span></span>D${pin}`;
+    $('board').appendChild(wrap);
+    ledEls[pin] = wrap.querySelector('span');
+  }
+
+  // ---------- Editor with line numbers + error markers ----------
+  let markers = {}; // line -> 'bad' | 'warn'
+  function renderGutter() {
+    const n = codeEl.value.split('\n').length;
+    gutterEl.innerHTML = Array.from({ length: n }, (_, k) =>
+      `<div class="${markers[k + 1] || ''}">${k + 1}</div>`).join('');
+    gutterEl.scrollTop = codeEl.scrollTop;
+  }
+  codeEl.value = BLINK_CODE;
+  codeEl.addEventListener('input', () => { markers = {}; renderGutter(); });
+  codeEl.addEventListener('scroll', () => (gutterEl.scrollTop = codeEl.scrollTop));
+  codeEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab') { e.preventDefault(); document.execCommand('insertText', false, '  '); }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') runBtn.click();
+  });
+  renderGutter();
+
+  function jumpToLine(line) {
+    const lines = codeEl.value.split('\n');
+    const start = lines.slice(0, line - 1).reduce((a, l) => a + l.length + 1, 0);
+    codeEl.focus();
+    codeEl.setSelectionRange(start, start + (lines[line - 1] || '').length);
+    codeEl.scrollTop = (line - 5) * 20;
+  }
+
+  // ---------- Intel HEX -> bytes ----------
+  // Each line ":LLAAAATT<data>CC" = length, address, record type, data, checksum.
+  function loadHex(hex, target) {
+    for (const line of hex.split(/\r?\n/)) {
+      if (line[0] !== ':' || line.substr(7, 2) !== '00') continue; // only data records
+      const len = parseInt(line.substr(1, 2), 16);
+      const addr = parseInt(line.substr(3, 4), 16);
+      for (let i = 0; i < len; i++) target[addr + i] = parseInt(line.substr(9 + i * 2, 2), 16);
+    }
+  }
+
+  // ---------- Simulator ----------
+  let running = false, rafId = 0;
+
+  function startSimulation(hex) {
+    stopSimulation();
+
+    // 1. 32 KB flash, filled with the compiled program
+    const program = new Uint16Array(0x8000 / 2);
+    loadHex(hex, new Uint8Array(program.buffer));
+
+    // 2. Virtual chip + the peripherals our sketches need
+    const cpu = new CPU(program);
+    new AVRTimer(cpu, timer0Config);                    // millis()/delay()
+    const portB = new AVRIOPort(cpu, portBConfig);      // digital pins 8..13
+    const portD = new AVRIOPort(cpu, portDConfig);      // digital pins 0..7
+    const usart = new AVRUSART(cpu, usart0Config, CPU_HZ); // Serial
+
+    // 3. When a pin changes, update the LED on screen
+    portB.addListener(() => {
+      for (let pin = 8; pin <= 13; pin++) {
+        ledEls[pin].classList.toggle('on', portB.pinState(pin - 8) === PinState.High);
+      }
+    });
+    void portD; // available for pins 0..7 if you add more components
+
+    usart.onByteTransmit = (byte) => {
+      serialEl.textContent += String.fromCharCode(byte);
+      if (serialEl.textContent.length > 20000) serialEl.textContent = serialEl.textContent.slice(-10000);
+      serialEl.scrollTop = serialEl.scrollHeight;
+    };
+
+    // 4. Run in real time: each animation frame, execute the CPU cycles that "should" have elapsed
+    running = true;
+    let last = performance.now();
+    const t0 = last;
+    const frame = (now) => {
+      if (!running) return;
+      const elapsed = Math.min(now - last, 50); // cap after tab switches
+      last = now;
+      const target = cpu.cycles + (elapsed / 1000) * CPU_HZ;
+      while (cpu.cycles < target) {
+        avrInstruction(cpu); // execute one AVR instruction
+        cpu.tick();          // advance timers / interrupts
+      }
+      metaEl.textContent = `Running · sim time ${(cpu.cycles / CPU_HZ).toFixed(1)}s · wall ${((now - t0) / 1000).toFixed(1)}s`;
+      rafId = requestAnimationFrame(frame);
+    };
+    rafId = requestAnimationFrame(frame);
+    stopBtn.disabled = false;
+  }
+
+  function stopSimulation() {
+    running = false;
+    cancelAnimationFrame(rafId);
+    Object.values(ledEls).forEach((el) => el.classList.remove('on'));
+    metaEl.textContent = 'Simulator stopped.';
+    stopBtn.disabled = true;
+  }
+
+  // ---------- Compile ----------
+  async function compileAndRun() {
+    runBtn.disabled = true;
+    statusEl.textContent = 'Compiling…';
+    serialEl.textContent = '';
+    markers = {};
+    renderGutter();
+
+    try {
+      const res = await fetch(COMPILE_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-student-id': 'demo-student' },
+        body: JSON.stringify({ sketch: codeEl.value }),
+      });
+      const data = await res.json().catch(() => ({ success: false, error: `HTTP ${res.status}` }));
+
+      if (data.success) {
+        const bytes = data.hex.split(/\r?\n/).filter((l) => l.startsWith(':') && l.substr(7, 2) === '00')
+          .reduce((a, l) => a + parseInt(l.substr(1, 2), 16), 0);
+        statusEl.textContent = `✅ Compiled in ${data.durationMs} ms${data.cached ? ' (cached)' : ''} · ${bytes} bytes`;
+        diagEl.innerHTML = `<div class="ok">Build OK – program uses ${bytes} of 32,256 bytes of flash. Running…</div>`;
+        startSimulation(data.hex);
+      } else if (data.diagnostics) {
+        stopSimulation();
+        statusEl.textContent = `❌ ${data.diagnostics.filter((d) => d.severity === 'error').length} error(s)`;
+        for (const d of data.diagnostics) markers[d.line] = d.severity === 'error' ? 'bad' : (markers[d.line] || 'warn');
+        renderGutter();
+        diagEl.innerHTML = data.diagnostics.length
+          ? data.diagnostics.map((d) =>
+              `<div class="${d.severity}" data-line="${d.line}"><b>${d.severity}</b> line ${d.line}:${d.column} – ${escapeHtml(d.message)}</div>`).join('')
+          : `<div class="error"><pre>${escapeHtml(data.rawOutput || 'Unknown error')}</pre></div>`;
+      } else {
+        stopSimulation();
+        statusEl.textContent = '❌ Request failed';
+        diagEl.innerHTML = `<div class="error"><b>error</b> ${escapeHtml(data.error || 'Unknown error')}</div>`;
+      }
+    } catch (err) {
+      statusEl.textContent = '❌ Cannot reach compile server';
+      diagEl.innerHTML = `<div class="error"><b>error</b> Is the container running on port 8080? (${escapeHtml(err.message)})</div>`;
+    } finally {
+      runBtn.disabled = false;
+    }
+  }
+
+  diagEl.addEventListener('click', (e) => {
+    const line = e.target.closest('[data-line]')?.dataset.line;
+    if (line) jumpToLine(Number(line));
+  });
+  runBtn.addEventListener('click', compileAndRun);
+  stopBtn.addEventListener('click', stopSimulation);
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+  }
+</script>
+</body>
+</html>
